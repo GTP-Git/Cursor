@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+logs/
+cruises.db
+sailings.json
+.check_prices.lock/
+.DS_Store

@@ -1,0 +1,8 @@
+streamlit>=1.32.0
+playwright>=1.42.0
+pandas>=2.0.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+xgboost>=2.0.0
+lightgbm>=4.0.0
+holidays>=0.40
