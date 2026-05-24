@@ -23,9 +23,12 @@ from scraper import (
     PlaywrightSetupError,
     add_cruise,
     check_playwright_ready,
+    cruise_url_is_tracked,
     delete_cruise,
     detect_cabin_inversions,
+    discover_itinerary_sail_dates,
     get_all_cruises,
+    is_itinerary_url,
     set_manual_voom_price,
     get_connection,
     get_cruise_by_id,
@@ -391,7 +394,18 @@ with st.sidebar:
         "Royal Caribbean URL",
         placeholder="https://www.royalcaribbean.com/...",
     )
-    st.caption("Paste the URL, then click **Add cruise**. First scrape takes ~30–90 seconds.")
+    track_all_dates = st.checkbox(
+        "Track all available sail dates for this itinerary",
+        value=True,
+        help=(
+            "Royal Caribbean prices change by departure date. "
+            "When enabled, every open sail date for the itinerary is tracked separately."
+        ),
+    )
+    st.caption(
+        "Paste an itinerary URL, then click **Add cruise**. "
+        "Tracking all sail dates runs one price check per departure (~30–90s each)."
+    )
 
     if st.button("Add cruise", type="primary", use_container_width=True):
         st.session_state["last_error"] = None
@@ -407,46 +421,104 @@ with st.sidebar:
             st.session_state["last_error"] = playwright_message
             st.error("Fix Playwright setup (see main page) before adding cruises.")
         else:
-            with st.spinner("Fetching cruise details (first scrape)…"):
-                try:
-                    scraped = scrape_cruise_url(new_url.strip())
-                    with get_connection() as conn:
-                        existing = conn.execute(
-                            "SELECT id FROM cruises WHERE url = ?", (scraped["url"],)
-                        ).fetchone()
-                        if not existing:
-                            existing = conn.execute(
-                                "SELECT id FROM cruises WHERE url = ?", (new_url.strip(),)
-                            ).fetchone()
-                        if existing:
-                            msg = "That cruise is already being tracked."
-                            st.session_state["last_error"] = msg
-                            st.warning(msg)
-                        else:
+            url = new_url.strip()
+            use_all_dates = track_all_dates and is_itinerary_url(url)
+            try:
+                targets: list[dict[str, str]] = []
+                ship_label = "cruise"
+                discovery: dict[str, Any] = {}
+
+                if use_all_dates:
+                    with st.spinner("Finding available sail dates for this itinerary…"):
+                        discovery = discover_itinerary_sail_dates(url)
+                    targets = discovery.get("sail_dates") or []
+                    ship_label = discovery.get("ship_name") or ship_label
+                    if not targets:
+                        msg = "No open sail dates were found for that itinerary."
+                        st.session_state["last_error"] = msg
+                        st.warning(msg)
+                else:
+                    targets = [{"url": url, "sailing_date": "selected date"}]
+
+                if targets:
+                    progress = st.progress(0.0, text="Starting price checks…")
+                    added = 0
+                    skipped = 0
+                    total_prices = 0
+                    added_dates: list[str] = []
+
+                    for index, target in enumerate(targets):
+                        sail_url = target["url"]
+                        sail_label = target.get("sailing_date") or sail_url
+                        progress.progress(
+                            index / max(len(targets), 1),
+                            text=f"Checking prices for {sail_label} ({index + 1}/{len(targets)})…",
+                        )
+                        scraped = scrape_cruise_url(sail_url)
+                        if not scraped.get("ship_name") or scraped["ship_name"] == "Unknown Ship":
+                            if use_all_dates and discovery.get("ship_name"):
+                                scraped["ship_name"] = discovery["ship_name"]
+                        if not scraped.get("duration") and use_all_dates and discovery.get("duration"):
+                            scraped["duration"] = discovery["duration"]
+                        if not scraped.get("departure_port") and use_all_dates:
+                            scraped["departure_port"] = discovery.get("departure_port")
+                        if not scraped.get("itinerary") and use_all_dates:
+                            scraped["itinerary"] = discovery.get("itinerary")
+
+                        with get_connection() as conn:
+                            if cruise_url_is_tracked(conn, scraped["url"]) or cruise_url_is_tracked(
+                                conn, sail_url
+                            ):
+                                skipped += 1
+                                continue
                             cruise_id = add_cruise(conn, scraped)
                             insert_pricing_snapshot(conn, cruise_id, scraped)
-                            st.session_state["last_error"] = None
-                            found_prices = sum(
+                            added += 1
+                            added_dates.append(str(scraped.get("sailing_date") or sail_label))
+                            total_prices += sum(
                                 1 for col in PRICE_COLUMNS if scraped.get(col)
                             )
-                            price_note = (
-                                f" Captured {found_prices}/5 price fields."
-                                if found_prices
-                                else " Cruise saved, but no prices were found on the page yet — try **Check Prices Now**."
+
+                    progress.progress(1.0, text="Done.")
+                    progress.empty()
+
+                    if added:
+                        st.session_state["last_error"] = None
+                        if use_all_dates and len(targets) > 1:
+                            date_summary = ", ".join(added_dates[:4])
+                            if len(added_dates) > 4:
+                                date_summary += f", +{len(added_dates) - 4} more"
+                            st.session_state["last_add_success"] = (
+                                f"Now tracking **{ship_label}** on **{added} sail dates** "
+                                f"({date_summary})."
                             )
+                        else:
                             st.session_state["last_add_success"] = (
                                 f"Now tracking **{scraped['ship_name']}** "
-                                f"(sailing {scraped['sailing_date']}).{price_note}"
+                                f"(sailing {scraped['sailing_date']})."
                             )
-                    if st.session_state.get("last_add_success"):
-                        st.rerun()
-                except PlaywrightSetupError as exc:
-                    st.session_state["last_error"] = str(exc)
-                    st.error(str(exc))
-                except Exception as exc:
-                    msg = f"Could not add cruise: {exc}"
-                    st.session_state["last_error"] = msg
-                    st.error(msg)
+                        if skipped:
+                            st.session_state["last_add_success"] += (
+                                f" Skipped {skipped} date(s) already being tracked."
+                            )
+                    elif skipped:
+                        msg = "All sail dates for that itinerary are already being tracked."
+                        st.session_state["last_error"] = msg
+                        st.warning(msg)
+                    else:
+                        msg = "No cruises were added."
+                        st.session_state["last_error"] = msg
+                        st.warning(msg)
+
+                if st.session_state.get("last_add_success"):
+                    st.rerun()
+            except PlaywrightSetupError as exc:
+                st.session_state["last_error"] = str(exc)
+                st.error(str(exc))
+            except Exception as exc:
+                msg = f"Could not add cruise: {exc}"
+                st.session_state["last_error"] = msg
+                st.error(msg)
 
     st.divider()
     st.header("Remove tracked cruise")

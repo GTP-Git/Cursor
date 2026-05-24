@@ -11,7 +11,7 @@ import re
 import sqlite3
 import time
 from contextlib import contextmanager
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -1039,6 +1039,157 @@ def _extract_from_dom(page: Page) -> dict[str, float | None]:
         return {k: parse_price(v) if k.endswith("_price") else v for k, v in raw.items()}
     except Exception:
         return {col: None for col in PRICE_COLUMNS}
+
+
+def is_itinerary_url(url: str) -> bool:
+    """True when the URL points at an RC itinerary page (supports multi-date discovery)."""
+    return "/itinerary/" in urlparse(url).path.lower()
+
+
+def _itinerary_url_for_sail_date(
+    base_url: str,
+    sail_date: str,
+    *,
+    package_code: str | None = None,
+    group_id: str | None = None,
+) -> str:
+    """Build an itinerary URL for a specific sail date."""
+    parsed = urlparse(base_url)
+    query = parse_qs(parsed.query)
+    query["sailDate"] = [sail_date]
+    if package_code:
+        query["packageCode"] = [package_code]
+    if group_id:
+        query["groupId"] = [group_id]
+    flat = {key: values[0] for key, values in query.items() if values}
+    return urlunparse(parsed._replace(query=urlencode(flat)))
+
+
+def _parse_sailings_response(data: Any) -> list[dict[str, Any]]:
+    """Extract open sail dates from the RC itinerary sailings API payload."""
+    if isinstance(data, dict):
+        sailings = data.get("sailings") or []
+    elif isinstance(data, list):
+        sailings = data
+    else:
+        return []
+
+    results: list[dict[str, Any]] = []
+    for item in sailings:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "OPEN").upper()
+        if status not in {"OPEN", "AVAILABLE"}:
+            continue
+        sail_date = item.get("sailDate") or item.get("startDate")
+        if not sail_date:
+            continue
+        results.append(
+            {
+                "sailing_date": str(sail_date),
+                "package_code": item.get("packageCode"),
+                "status": status,
+            }
+        )
+    return results
+
+
+def discover_itinerary_sail_dates(url: str, timeout_ms: int = 60_000) -> dict[str, Any]:
+    """
+    Load an RC itinerary page and return every open sail date with a bookable URL.
+    Royal Caribbean prices vary by departure date; each sail date is tracked separately.
+    """
+    captured_payload: dict[str, Any] | None = None
+    api_request_url: str | None = None
+
+    with sync_playwright() as playwright:
+        browser, context = _browser_context(playwright)
+        page = context.new_page()
+
+        def on_response(response: Response) -> None:
+            nonlocal captured_payload, api_request_url
+            if "itinerary/api/v1/sailings" not in response.url or response.status != 200:
+                return
+            api_request_url = response.url
+            try:
+                captured_payload = response.json()
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            _dismiss_overlays(page)
+            page.wait_for_timeout(2500)
+            try:
+                page.wait_for_load_state("networkidle", timeout=15_000)
+            except Exception:
+                pass
+            _dismiss_overlays(page)
+            page.wait_for_timeout(1500)
+
+            canonical = page.url or url
+            url_meta = _metadata_from_url(canonical)
+            dom_data = _extract_from_dom(page)
+            booking_params = _booking_params_from_url(canonical)
+            package_code = booking_params.get("packageCode") or ""
+
+            group_id = None
+            if api_request_url:
+                group_id = parse_qs(urlparse(api_request_url).query).get("groupId", [None])[0]
+            if not group_id:
+                group_id = parse_qs(urlparse(canonical).query).get("groupId", [None])[0]
+
+            sail_dates: list[dict[str, Any]] = []
+            for entry in _parse_sailings_response(captured_payload):
+                sail_url = _itinerary_url_for_sail_date(
+                    canonical,
+                    entry["sailing_date"],
+                    package_code=str(entry.get("package_code") or package_code or ""),
+                    group_id=group_id,
+                )
+                sail_dates.append(
+                    {
+                        "sailing_date": entry["sailing_date"],
+                        "url": sail_url,
+                        "package_code": entry.get("package_code") or package_code,
+                        "group_id": group_id,
+                    }
+                )
+
+            if not sail_dates:
+                sail_dates.append(
+                    {
+                        "sailing_date": (
+                            dom_data.get("sailing_date")
+                            or url_meta.get("sailing_date")
+                            or "TBD"
+                        ),
+                        "url": canonical,
+                        "package_code": package_code,
+                        "group_id": group_id,
+                    }
+                )
+
+            return {
+                "ship_name": dom_data.get("ship_name") or url_meta.get("ship_name"),
+                "duration": dom_data.get("duration") or url_meta.get("duration"),
+                "departure_port": dom_data.get("departure_port") or url_meta.get("departure_port"),
+                "itinerary": dom_data.get("itinerary"),
+                "package_code": package_code,
+                "group_id": group_id,
+                "sail_dates": sail_dates,
+            }
+        finally:
+            context.close()
+            browser.close()
+
+
+def cruise_url_is_tracked(conn: sqlite3.Connection, url: str) -> bool:
+    """Return True if this exact URL is already in the cruises table."""
+    row = conn.execute("SELECT 1 FROM cruises WHERE url = ? LIMIT 1", (url,)).fetchone()
+    return row is not None
 
 
 def scrape_cruise_url(url: str, timeout_ms: int = 60_000) -> dict[str, Any]:
