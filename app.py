@@ -27,9 +27,9 @@ from scraper import (
     delete_cruise,
     detect_cabin_inversions,
     discover_itinerary_sail_dates,
+    filter_sail_dates_by_month,
     get_all_cruises,
     is_itinerary_url,
-    set_manual_voom_price,
     get_connection,
     get_cruise_by_id,
     get_latest_pricing,
@@ -90,6 +90,17 @@ st.markdown(
         color: #4a235a;
         font-weight: 600;
     }
+    /* Tracked cruises: pinned header row above scrollable body */
+    div[data-testid="stVerticalBlockBorderWrapper"]:has(.tracked-cruises-table-marker)
+        > div[data-testid="stVerticalBlock"] > div[data-testid="stVerticalBlock"]:first-child {
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        background: var(--secondary-background-color, #f0f2f6);
+        border-bottom: 1px solid rgba(49, 51, 63, 0.2);
+        padding-bottom: 0.35rem;
+        margin-bottom: 0.15rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -111,13 +122,80 @@ def _format_total_per_night(total: Any, nights: int) -> str:
     return f"${total_f:,.0f}/${per_night:,.0f}"
 
 
-def _format_voom_price(daily: Any, nights: int) -> str:
-    """Format Voom as $88/$22 (voyage total per device / per day)."""
-    if daily is None or (isinstance(daily, float) and pd.isna(daily)) or nights < 1:
-        return "—"
-    daily_f = float(daily)
-    voyage_total = round(daily_f * nights)
-    return f"${voyage_total:,.0f}/${daily_f:,.0f}"
+def _format_sail_date_label(sail_date: str) -> str:
+    try:
+        return datetime.strptime(sail_date[:10], "%Y-%m-%d").strftime("%a %b %d, %Y")
+    except ValueError:
+        return sail_date
+
+
+def _month_label(month_key: str) -> str:
+    try:
+        return datetime.strptime(month_key, "%Y-%m").strftime("%B %Y")
+    except ValueError:
+        return month_key
+
+
+def _sail_date_from_url(url: str) -> str | None:
+    from urllib.parse import parse_qs, urlparse
+
+    query = parse_qs(urlparse(url).query)
+    for key in ("sailDate", "sail-date", "sail_date"):
+        if query.get(key):
+            return query[key][0][:10]
+    return None
+
+
+def _apply_itinerary_metadata(scraped: dict[str, Any], discovery: dict[str, Any]) -> None:
+    if not scraped.get("ship_name") or scraped["ship_name"] == "Unknown Ship":
+        if discovery.get("ship_name"):
+            scraped["ship_name"] = discovery["ship_name"]
+    if not scraped.get("duration") and discovery.get("duration"):
+        scraped["duration"] = discovery["duration"]
+    if not scraped.get("departure_port") and discovery.get("departure_port"):
+        scraped["departure_port"] = discovery["departure_port"]
+    if not scraped.get("itinerary") and discovery.get("itinerary"):
+        scraped["itinerary"] = discovery["itinerary"]
+
+
+def _add_tracked_sail_dates(
+    targets: list[dict[str, Any]],
+    discovery: dict[str, Any] | None,
+    *,
+    progress_label: str = "Checking prices",
+) -> tuple[int, int, list[str], str]:
+    """Scrape and persist selected sail dates. Returns added, skipped, dates, ship name."""
+    added = 0
+    skipped = 0
+    added_dates: list[str] = []
+    ship_label = (discovery or {}).get("ship_name") or "cruise"
+    progress = st.progress(0.0, text="Starting price checks…")
+
+    for index, target in enumerate(targets):
+        sail_url = str(target["url"])
+        sail_label = str(target.get("sailing_date") or sail_url)
+        progress.progress(
+            index / max(len(targets), 1),
+            text=f"{progress_label} for {sail_label} ({index + 1}/{len(targets)})…",
+        )
+        scraped = scrape_cruise_url(sail_url)
+        if discovery:
+            _apply_itinerary_metadata(scraped, discovery)
+        if scraped.get("ship_name"):
+            ship_label = scraped["ship_name"]
+
+        with get_connection() as conn:
+            if cruise_url_is_tracked(conn, scraped["url"]) or cruise_url_is_tracked(conn, sail_url):
+                skipped += 1
+                continue
+            cruise_id = add_cruise(conn, scraped)
+            insert_pricing_snapshot(conn, cruise_id, scraped)
+            added += 1
+            added_dates.append(str(scraped.get("sailing_date") or sail_label))
+
+    progress.progress(1.0, text="Done.")
+    progress.empty()
+    return added, skipped, added_dates, ship_label
 
 
 def _pricing_to_dataframe(rows: list[sqlite3.Row]) -> pd.DataFrame:
@@ -257,6 +335,28 @@ def render_price_predictions(cruise_id: int) -> None:
                 )
 
 
+CRUISE_TABLE_COLUMNS = (2.2, 1.4, 1, 1, 1, 1, 1, 1.4, 0.35)
+CRUISE_TABLE_HEADERS = (
+    "Ship",
+    "Sailing Date",
+    "Duration",
+    "Interior",
+    "Ocean View",
+    "Balcony",
+    "Suite",
+    "Last Check",
+    "",
+)
+CRUISE_TABLE_SCROLL_HEIGHT = 520
+CRUISE_TABLE_SCROLL_THRESHOLD = 6
+
+
+def _render_cruise_table_header() -> None:
+    header_cols = st.columns(CRUISE_TABLE_COLUMNS)
+    for col, label in zip(header_cols, CRUISE_TABLE_HEADERS):
+        col.markdown(f"**{label}**")
+
+
 def render_cruise_dashboard() -> None:
     with get_connection() as conn:
         cruises = get_all_cruises(conn)
@@ -265,48 +365,85 @@ def render_cruise_dashboard() -> None:
         st.info("No cruises tracked yet. Add a Royal Caribbean URL in the sidebar.")
         return
 
-    records = []
-    for cruise in cruises:
-        with get_connection() as conn:
-            latest = get_latest_pricing(conn, cruise["id"])
-        nights = parse_night_count(cruise["duration"], cruise["url"])
-        records.append(
-            {
-                "ID": cruise["id"],
-                "Ship": cruise["ship_name"],
-                "Sailing Date": cruise["sailing_date"],
-                "Duration": cruise["duration"] or "—",
-                "Departure": cruise["departure_port"] or "—",
-                "Interior": _format_total_per_night(
-                    latest["interior_price"] if latest else None, nights
-                ),
-                "Ocean View": _format_total_per_night(
-                    latest["oceanview_price"] if latest else None, nights
-                ),
-                "Balcony": _format_total_per_night(
-                    latest["balcony_price"] if latest else None, nights
-                ),
-                "Suite": _format_total_per_night(
-                    latest["suite_price"] if latest else None, nights
-                ),
-                "Voom (device)": _format_voom_price(
-                    latest["voom_price"] if latest else None, nights
-                ),
-                "Last Check": (
-                    latest["timestamp"][:19].replace("T", " ")
-                    if latest and latest["timestamp"]
-                    else "Never"
-                ),
-            }
-        )
+    if "pending_delete_cruise_id" not in st.session_state:
+        st.session_state.pending_delete_cruise_id = None
 
     st.caption(
         "Cabin prices are **per person** (total/night). "
-        "Voom is **per device** (voyage total/day). Royal Caribbean often only lists "
-        "internet in **Cruise Planner** after booking—use the sidebar to enter it manually "
-        "if auto-scrape shows —."
+        "Click **×** to stop tracking a sail date."
     )
-    st.dataframe(pd.DataFrame(records), use_container_width=True, hide_index=True)
+
+    with st.container(border=True):
+        st.markdown('<div class="tracked-cruises-table-marker"></div>', unsafe_allow_html=True)
+        _render_cruise_table_header()
+
+        use_scroll = len(cruises) > CRUISE_TABLE_SCROLL_THRESHOLD
+        if use_scroll:
+            list_container: Any = st.container(height=CRUISE_TABLE_SCROLL_HEIGHT)
+        else:
+            list_container = st.container()
+
+        with list_container:
+            for cruise in cruises:
+                with get_connection() as conn:
+                    latest = get_latest_pricing(conn, cruise["id"])
+                nights = parse_night_count(cruise["duration"], cruise["url"])
+                cruise_id = int(cruise["id"])
+
+                row_cols = st.columns(CRUISE_TABLE_COLUMNS)
+                row_cols[0].write(cruise["ship_name"])
+                row_cols[1].write(cruise["sailing_date"])
+                row_cols[2].write(cruise["duration"] or "—")
+                row_cols[3].write(
+                    _format_total_per_night(latest["interior_price"] if latest else None, nights)
+                )
+                row_cols[4].write(
+                    _format_total_per_night(latest["oceanview_price"] if latest else None, nights)
+                )
+                row_cols[5].write(
+                    _format_total_per_night(latest["balcony_price"] if latest else None, nights)
+                )
+                row_cols[6].write(
+                    _format_total_per_night(latest["suite_price"] if latest else None, nights)
+                )
+                row_cols[7].write(
+                    latest["timestamp"][:19].replace("T", " ")
+                    if latest and latest["timestamp"]
+                    else "Never"
+                )
+                with row_cols[8]:
+                    if st.button(
+                        "×",
+                        key=f"remove_cruise_{cruise_id}",
+                        help="Stop tracking this sail date",
+                    ):
+                        st.session_state.pending_delete_cruise_id = cruise_id
+                        st.rerun()
+
+                if st.session_state.pending_delete_cruise_id == cruise_id:
+                    st.warning(
+                        f"Remove **{cruise['ship_name']}** sailing **{cruise['sailing_date']}**? "
+                        "All price history for this departure will be deleted."
+                    )
+                    confirm_col, cancel_col = st.columns(2)
+                    if confirm_col.button(
+                        "Yes, remove this sail date",
+                        key=f"confirm_remove_{cruise_id}",
+                        type="primary",
+                    ):
+                        with get_connection() as conn:
+                            delete_cruise(conn, cruise_id)
+                        st.session_state.pending_delete_cruise_id = None
+                        st.session_state.pop("last_scrape_summary", None)
+                        st.session_state["last_delete_success"] = (
+                            f"Removed **{cruise['ship_name']}** sailing **{cruise['sailing_date']}**."
+                        )
+                        st.rerun()
+                    if cancel_col.button("Cancel", key=f"cancel_remove_{cruise_id}"):
+                        st.session_state.pending_delete_cruise_id = None
+                        st.rerun()
+
+                st.divider()
 
 
 def render_price_history(cruise_id: int) -> None:
@@ -337,7 +474,6 @@ def render_price_history(cruise_id: int) -> None:
         "oceanview_price": "Ocean View",
         "balcony_price": "Balcony",
         "suite_price": "Suite",
-        "voom_price": "Voom (Internet)",
     }
 
     tabs = st.tabs(list(chart_labels.values()))
@@ -357,13 +493,10 @@ def render_price_history(cruise_id: int) -> None:
         display["timestamp"] = display["timestamp"].dt.strftime("%Y-%m-%d %H:%M UTC")
         for col in PRICE_COLUMNS:
             if col == "voom_price":
-                display[col] = display[col].apply(
-                    lambda v: _format_voom_price(v, nights) if pd.notna(v) else "—"
-                )
-            else:
-                display[col] = display[col].apply(
-                    lambda v: _format_total_per_night(v, nights) if pd.notna(v) else "—"
-                )
+                continue
+            display[col] = display[col].apply(
+                lambda v: _format_total_per_night(v, nights) if pd.notna(v) else "—"
+            )
         st.dataframe(display, use_container_width=True, hide_index=True)
 
 
@@ -393,205 +526,166 @@ with st.sidebar:
     new_url = st.text_input(
         "Royal Caribbean URL",
         placeholder="https://www.royalcaribbean.com/...",
+        key="new_cruise_url",
     )
-    track_all_dates = st.checkbox(
-        "Track all available sail dates for this itinerary",
-        value=True,
-        help=(
-            "Royal Caribbean prices change by departure date. "
-            "When enabled, every open sail date for the itinerary is tracked separately."
-        ),
-    )
-    st.caption(
-        "Paste an itinerary URL, then click **Add cruise**. "
-        "Tracking all sail dates runs one price check per departure (~30–90s each)."
-    )
+    url = new_url.strip()
+    is_itinerary = bool(url) and is_itinerary_url(url)
 
-    if st.button("Add cruise", type="primary", use_container_width=True):
-        st.session_state["last_error"] = None
-        if not new_url.strip():
-            msg = "Enter a valid Royal Caribbean URL."
-            st.session_state["last_error"] = msg
-            st.error(msg)
-        elif "royalcaribbean.com" not in new_url.lower():
-            msg = "URL should be from royalcaribbean.com."
-            st.session_state["last_error"] = msg
-            st.warning(msg)
-        elif not playwright_ok:
-            st.session_state["last_error"] = playwright_message
-            st.error("Fix Playwright setup (see main page) before adding cruises.")
-        else:
-            url = new_url.strip()
-            use_all_dates = track_all_dates and is_itinerary_url(url)
-            try:
-                targets: list[dict[str, str]] = []
-                ship_label = "cruise"
-                discovery: dict[str, Any] = {}
+    if url and url != st.session_state.get("itinerary_discovery_url", ""):
+        st.session_state.pop("itinerary_discovery", None)
 
-                if use_all_dates:
-                    with st.spinner("Finding available sail dates for this itinerary…"):
-                        discovery = discover_itinerary_sail_dates(url)
-                    targets = discovery.get("sail_dates") or []
-                    ship_label = discovery.get("ship_name") or ship_label
-                    if not targets:
-                        msg = "No open sail dates were found for that itinerary."
-                        st.session_state["last_error"] = msg
-                        st.warning(msg)
+    if is_itinerary:
+        st.caption(
+            "Itinerary link detected. Find available departures, filter by month, "
+            "then choose which sail dates to track (~30–90s per date)."
+        )
+        if st.button("Find sail dates", use_container_width=True, disabled=not playwright_ok):
+            st.session_state["last_error"] = None
+            if not playwright_ok:
+                st.error("Fix Playwright setup (see main page) before adding cruises.")
+            else:
+                try:
+                    with st.spinner("Loading available sail dates…"):
+                        st.session_state["itinerary_discovery"] = discover_itinerary_sail_dates(url)
+                        st.session_state["itinerary_discovery_url"] = url
+                except PlaywrightSetupError as exc:
+                    st.session_state["last_error"] = str(exc)
+                    st.error(str(exc))
+                except Exception as exc:
+                    st.session_state["last_error"] = f"Could not load sail dates: {exc}"
+                    st.error(st.session_state["last_error"])
+
+        discovery = st.session_state.get("itinerary_discovery")
+        if discovery and st.session_state.get("itinerary_discovery_url") == url:
+            sail_dates: list[dict[str, Any]] = discovery.get("sail_dates") or []
+            ship_name = discovery.get("ship_name") or "this itinerary"
+            st.success(f"**{ship_name}** — {len(sail_dates)} open departure(s)")
+
+            month_keys = sorted(
+                {str(entry["sailing_date"])[:7] for entry in sail_dates if entry.get("sailing_date")}
+            )
+            month_options = {"all": "All months"}
+            for month_key in month_keys:
+                count = sum(
+                    1 for entry in sail_dates if str(entry.get("sailing_date", "")).startswith(month_key)
+                )
+                month_options[month_key] = f"{_month_label(month_key)} ({count})"
+
+            selected_month = st.selectbox(
+                "Filter by month",
+                options=list(month_options.keys()),
+                format_func=lambda key: month_options[key],
+                key="sail_date_month_filter",
+            )
+            filtered_dates = filter_sail_dates_by_month(sail_dates, selected_month)
+
+            date_labels = {
+                _format_sail_date_label(str(entry["sailing_date"])): entry
+                for entry in filtered_dates
+            }
+            multiselect_key = f"selected_sail_dates_{selected_month}"
+            if multiselect_key not in st.session_state:
+                url_sail_date = _sail_date_from_url(url)
+                st.session_state[multiselect_key] = [
+                    label
+                    for label, entry in date_labels.items()
+                    if str(entry.get("sailing_date", ""))[:10] == url_sail_date
+                ]
+
+            if st.checkbox(
+                "Select all dates in this month",
+                value=False,
+                key=f"select_all_sail_dates_{selected_month}",
+            ):
+                st.session_state[multiselect_key] = list(date_labels.keys())
+
+            selected_labels = st.multiselect(
+                "Departure dates to track",
+                options=list(date_labels.keys()),
+                key=multiselect_key,
+            )
+
+            if st.button("Add selected sail dates", type="primary", use_container_width=True):
+                st.session_state["last_error"] = None
+                if not selected_labels:
+                    msg = "Select at least one departure date."
+                    st.session_state["last_error"] = msg
+                    st.warning(msg)
+                elif not playwright_ok:
+                    st.session_state["last_error"] = playwright_message
+                    st.error("Fix Playwright setup (see main page) before adding cruises.")
                 else:
-                    targets = [{"url": url, "sailing_date": "selected date"}]
-
-                if targets:
-                    progress = st.progress(0.0, text="Starting price checks…")
-                    added = 0
-                    skipped = 0
-                    total_prices = 0
-                    added_dates: list[str] = []
-
-                    for index, target in enumerate(targets):
-                        sail_url = target["url"]
-                        sail_label = target.get("sailing_date") or sail_url
-                        progress.progress(
-                            index / max(len(targets), 1),
-                            text=f"Checking prices for {sail_label} ({index + 1}/{len(targets)})…",
+                    try:
+                        targets = [date_labels[label] for label in selected_labels]
+                        added, skipped, added_dates, ship_label = _add_tracked_sail_dates(
+                            targets, discovery
                         )
-                        scraped = scrape_cruise_url(sail_url)
-                        if not scraped.get("ship_name") or scraped["ship_name"] == "Unknown Ship":
-                            if use_all_dates and discovery.get("ship_name"):
-                                scraped["ship_name"] = discovery["ship_name"]
-                        if not scraped.get("duration") and use_all_dates and discovery.get("duration"):
-                            scraped["duration"] = discovery["duration"]
-                        if not scraped.get("departure_port") and use_all_dates:
-                            scraped["departure_port"] = discovery.get("departure_port")
-                        if not scraped.get("itinerary") and use_all_dates:
-                            scraped["itinerary"] = discovery.get("itinerary")
-
-                        with get_connection() as conn:
-                            if cruise_url_is_tracked(conn, scraped["url"]) or cruise_url_is_tracked(
-                                conn, sail_url
-                            ):
-                                skipped += 1
-                                continue
-                            cruise_id = add_cruise(conn, scraped)
-                            insert_pricing_snapshot(conn, cruise_id, scraped)
-                            added += 1
-                            added_dates.append(str(scraped.get("sailing_date") or sail_label))
-                            total_prices += sum(
-                                1 for col in PRICE_COLUMNS if scraped.get(col)
-                            )
-
-                    progress.progress(1.0, text="Done.")
-                    progress.empty()
-
-                    if added:
-                        st.session_state["last_error"] = None
-                        if use_all_dates and len(targets) > 1:
+                        if added:
+                            st.session_state["last_error"] = None
                             date_summary = ", ".join(added_dates[:4])
                             if len(added_dates) > 4:
                                 date_summary += f", +{len(added_dates) - 4} more"
                             st.session_state["last_add_success"] = (
-                                f"Now tracking **{ship_label}** on **{added} sail dates** "
+                                f"Now tracking **{ship_label}** on **{added} sail date(s)** "
                                 f"({date_summary})."
                             )
-                        else:
-                            st.session_state["last_add_success"] = (
-                                f"Now tracking **{scraped['ship_name']}** "
-                                f"(sailing {scraped['sailing_date']})."
-                            )
-                        if skipped:
-                            st.session_state["last_add_success"] += (
-                                f" Skipped {skipped} date(s) already being tracked."
-                            )
-                    elif skipped:
-                        msg = "All sail dates for that itinerary are already being tracked."
+                            if skipped:
+                                st.session_state["last_add_success"] += (
+                                    f" Skipped {skipped} date(s) already being tracked."
+                                )
+                            st.rerun()
+                        elif skipped:
+                            msg = "All selected sail dates are already being tracked."
+                            st.session_state["last_error"] = msg
+                            st.warning(msg)
+                    except PlaywrightSetupError as exc:
+                        st.session_state["last_error"] = str(exc)
+                        st.error(str(exc))
+                    except Exception as exc:
+                        msg = f"Could not add cruise: {exc}"
                         st.session_state["last_error"] = msg
-                        st.warning(msg)
-                    else:
-                        msg = "No cruises were added."
-                        st.session_state["last_error"] = msg
-                        st.warning(msg)
+                        st.error(msg)
+    else:
+        st.caption("Paste a Royal Caribbean URL, then click **Add cruise** (~30–90 seconds).")
 
-                if st.session_state.get("last_add_success"):
-                    st.rerun()
-            except PlaywrightSetupError as exc:
-                st.session_state["last_error"] = str(exc)
-                st.error(str(exc))
-            except Exception as exc:
-                msg = f"Could not add cruise: {exc}"
+        if st.button("Add cruise", type="primary", use_container_width=True):
+            st.session_state["last_error"] = None
+            if not url:
+                msg = "Enter a valid Royal Caribbean URL."
                 st.session_state["last_error"] = msg
                 st.error(msg)
-
-    st.divider()
-    st.header("Remove tracked cruise")
-    with get_connection() as conn:
-        tracked = get_all_cruises(conn)
-
-    if tracked:
-        delete_options = {
-            f"{c['ship_name']} — {c['sailing_date']} (ID {c['id']})": c["id"]
-            for c in tracked
-        }
-        delete_label = st.selectbox(
-            "Select cruise to delete",
-            list(delete_options.keys()),
-            key="delete_cruise_select",
-        )
-        confirm_delete = st.checkbox(
-            "Yes, remove this cruise and all of its price history",
-            key="confirm_delete_cruise",
-        )
-        if st.button(
-            "Delete cruise",
-            type="secondary",
-            use_container_width=True,
-            disabled=not confirm_delete,
-        ):
-            cruise_id = delete_options[delete_label]
-            with get_connection() as conn:
-                removed = delete_cruise(conn, cruise_id)
-            if removed:
-                st.session_state.pop("last_scrape_summary", None)
-                st.session_state["last_delete_success"] = (
-                    f"Removed **{delete_label.split(' (ID')[0]}** from tracking."
-                )
-                st.rerun()
+            elif "royalcaribbean.com" not in url.lower():
+                msg = "URL should be from royalcaribbean.com."
+                st.session_state["last_error"] = msg
+                st.warning(msg)
+            elif not playwright_ok:
+                st.session_state["last_error"] = playwright_message
+                st.error("Fix Playwright setup (see main page) before adding cruises.")
             else:
-                st.session_state["last_error"] = "Could not delete that cruise."
-    else:
-        st.caption("No cruises to remove yet.")
-
-    st.divider()
-    st.header("Manual Voom price")
-    if tracked:
-        voom_options = {
-            f"{c['ship_name']} — {c['sailing_date']} (ID {c['id']})": c["id"]
-            for c in tracked
-        }
-        voom_label = st.selectbox(
-            "Cruise for Voom entry",
-            list(voom_options.keys()),
-            key="manual_voom_select",
-        )
-        manual_voom = st.number_input(
-            "Surf + Stream $/device/day",
-            min_value=0.0,
-            step=0.01,
-            format="%.2f",
-            help="From Cruise Planner → Internet. Example: 19.99",
-        )
-        if st.button("Save Voom price", use_container_width=True):
-            if manual_voom <= 0:
-                st.warning("Enter a price greater than zero.")
-            else:
-                cruise_id = voom_options[voom_label]
-                with get_connection() as conn:
-                    set_manual_voom_price(conn, cruise_id, float(manual_voom))
-                st.session_state["last_voom_success"] = (
-                    f"Saved Voom **${manual_voom:,.2f}/device/day** for "
-                    f"{voom_label.split(' (ID')[0]}."
-                )
-                st.rerun()
-    else:
-        st.caption("Add a cruise first, then enter Voom from Cruise Planner if needed.")
+                try:
+                    added, skipped, added_dates, ship_label = _add_tracked_sail_dates(
+                        [{"url": url, "sailing_date": "selected date"}],
+                        None,
+                    )
+                    if added:
+                        st.session_state["last_error"] = None
+                        st.session_state["last_add_success"] = (
+                            f"Now tracking **{ship_label}** (sailing {added_dates[0]})."
+                        )
+                        if skipped:
+                            st.session_state["last_add_success"] += " That cruise was already tracked."
+                        st.rerun()
+                    elif skipped:
+                        msg = "That cruise is already being tracked."
+                        st.session_state["last_error"] = msg
+                        st.warning(msg)
+                except PlaywrightSetupError as exc:
+                    st.session_state["last_error"] = str(exc)
+                    st.error(str(exc))
+                except Exception as exc:
+                    msg = f"Could not add cruise: {exc}"
+                    st.session_state["last_error"] = msg
+                    st.error(msg)
 
     st.divider()
     st.header("Price check")
@@ -607,9 +701,6 @@ if add_success := st.session_state.pop("last_add_success", None):
 
 if delete_success := st.session_state.pop("last_delete_success", None):
     st.success(delete_success)
-
-if voom_success := st.session_state.pop("last_voom_success", None):
-    st.success(voom_success)
 
 if st.session_state.pop("run_scrape", False):
     st.session_state["last_error"] = None

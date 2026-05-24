@@ -1186,6 +1186,16 @@ def discover_itinerary_sail_dates(url: str, timeout_ms: int = 60_000) -> dict[st
             browser.close()
 
 
+def filter_sail_dates_by_month(
+    sail_dates: list[dict[str, Any]], month_key: str | None
+) -> list[dict[str, Any]]:
+    """Keep sail dates in YYYY-MM when month_key is set; otherwise return all."""
+    if not month_key or month_key == "all":
+        return sail_dates
+    prefix = month_key[:7]
+    return [entry for entry in sail_dates if str(entry.get("sailing_date", "")).startswith(prefix)]
+
+
 def cruise_url_is_tracked(conn: sqlite3.Connection, url: str) -> bool:
     """Return True if this exact URL is already in the cruises table."""
     row = conn.execute("SELECT 1 FROM cruises WHERE url = ? LIMIT 1", (url,)).fetchone()
